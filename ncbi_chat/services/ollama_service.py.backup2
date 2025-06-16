@@ -36,30 +36,19 @@ class OllamaService:
             
             # Handle different response formats
             if response:
-                # Check if it's the new ListResponse format
-                if hasattr(response, 'models'):
-                    models = response.models
+                if isinstance(response, dict) and 'models' in response:
+                    models = response['models']
                     if models:
-                        # Extract model names
+                        # Extract model names safely
                         model_names = []
                         for m in models:
-                            if hasattr(m, 'model'):
-                                model_names.append(m.model)
-                            elif isinstance(m, dict) and 'name' in m:
+                            if isinstance(m, dict) and 'name' in m:
                                 model_names.append(m['name'])
                             elif isinstance(m, str):
                                 model_names.append(m)
+                            else:
+                                logger.warning(f"Unexpected model format: {m}")
                         
-                        logger.info(f"Successfully connected to Ollama. Available models: {model_names}")
-                        return True
-                    else:
-                        logger.warning("Connected to Ollama but no models found")
-                        return True
-                elif isinstance(response, dict) and 'models' in response:
-                    # Old format
-                    models = response['models']
-                    if models:
-                        model_names = [m.get('name', m) if isinstance(m, dict) else str(m) for m in models]
                         logger.info(f"Successfully connected to Ollama. Available models: {model_names}")
                         return True
                     else:
@@ -76,6 +65,7 @@ class OllamaService:
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             return False
+
     def _normalize_model_name(self, model_name: str) -> str:
         """Normalize model name to match Ollama's format"""
         # If the model name includes a variant (like :1b), keep it
@@ -169,24 +159,17 @@ class OllamaService:
                 
             # Handle different response formats
             models = []
-            
-            # Check if response has a 'models' attribute (new format)
-            if hasattr(response, 'models'):
-                raw_models = response.models
-            elif isinstance(response, dict) and 'models' in response:
-                raw_models = response.get('models', [])
+            if isinstance(response, dict) and 'models' in response:
+                models = response.get('models', [])
             elif isinstance(response, list):
-                raw_models = response
+                models = response
             else:
                 logger.warning(f"Unexpected response format: {type(response)}")
                 return True  # Assume it's available
             
             available_models = []
-            for m in raw_models:
-                # Check if it's a Model object with attributes
-                if hasattr(m, 'model'):
-                    available_models.append(m.model)
-                elif isinstance(m, dict) and 'name' in m:
+            for m in models:
+                if isinstance(m, dict) and 'name' in m:
                     available_models.append(m['name'])
                 elif isinstance(m, str):
                     available_models.append(m)
@@ -398,50 +381,34 @@ class OllamaService:
             # Handle the new ollama._types.ListResponse format
             models = []
             
-            # Check if response has a 'models' attribute (new format)
+            # The response is a ListResponse object with a 'models' attribute
             if hasattr(response, 'models'):
-                raw_models = response.models
-            elif isinstance(response, dict) and 'models' in response:
-                raw_models = response.get('models', [])
-            elif isinstance(response, list):
-                raw_models = response
-            else:
-                logger.warning(f"Unexpected response format: {type(response)}")
-                return []
-            
-            # Process models into consistent format
-            for m in raw_models:
-                # Check if it's a Model object with attributes
-                if hasattr(m, 'model'):
+                # This is the new format
+                for m in response.models:
+                    # m is a Model object with attributes: model, size, modified_at, etc.
                     model_dict = {
-                        'name': m.model,
-                        'size': getattr(m, 'size', 0),
-                        'modified': str(getattr(m, 'modified_at', ''))
+                        'name': m.model,  # The model name is in the 'model' attribute
+                        'size': m.size if hasattr(m, 'size') else 0,
+                        'modified': str(m.modified_at) if hasattr(m, 'modified_at') else ''
                     }
+                    
                     # Add details if available
-                    if hasattr(m, 'details'):
-                        details = m.details
-                        if details:
-                            model_dict['parameter_size'] = getattr(details, 'parameter_size', '')
-                            model_dict['quantization_level'] = getattr(details, 'quantization_level', '')
+                    if hasattr(m, 'details') and m.details:
+                        model_dict['parameter_size'] = getattr(m.details, 'parameter_size', '')
+                        model_dict['quantization_level'] = getattr(m.details, 'quantization_level', '')
+                    
                     models.append(model_dict)
-                elif isinstance(m, dict):
-                    models.append(m)
-                elif isinstance(m, str):
-                    models.append({'name': m})
-                else:
-                    logger.warning(f"Unexpected model format: {type(m)}")
+            elif isinstance(response, dict) and 'models' in response:
+                # Old format fallback
+                models = response.get('models', [])
             
-            # Sort models by name for consistent display
+            # Sort models by name
             models.sort(key=lambda x: x.get('name', ''))
-            logger.info(f"Processed {len(models)} models: {[m['name'] for m in models]}")
+            logger.info(f"Processed {len(models)} models successfully")
             return models
+            
         except Exception as e:
             logger.error(f"Error fetching models: {str(e)}")
             import traceback
             logger.error(f"Traceback: {traceback.format_exc()}")
             return []
-        
-
-
-ollama_service = OllamaService()
