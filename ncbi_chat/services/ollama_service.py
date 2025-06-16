@@ -1,0 +1,411 @@
+import asyncio
+import json
+import logging
+from typing import Dict, List, Optional, Any
+import ollama
+from django.core.cache import cache
+from .settings import get_ollama_settings
+
+logger = logging.getLogger(__name__)
+
+class OllamaService:
+    def __init__(self):
+        self._setup_service()
+        self.conversation_history = {}  # Store conversation history per user
+        self.max_history_length = 10    # Maximum number of messages to keep in history
+
+    def _setup_service(self):
+        """Setup service with current settings"""
+        settings = get_ollama_settings()
+        host = settings['host']
+        logger.info(f"Setting up Ollama client with host: {host}")
+        
+        self.client = ollama.AsyncClient(host=host)
+        self.models = settings['models']
+        self.timeout = settings['timeout']
+        self.max_retries = settings['max_retries']
+        
+        # Log current configuration
+        logger.info(f"Ollama service initialized with models: {self.models}")
+
+    async def check_ollama_connection(self) -> bool:
+        """Check if Ollama server is accessible"""
+        try:
+            logger.info("Checking Ollama connection...")
+            response = await self.client.list()
+            
+            # Handle different response formats
+            if response:
+                if isinstance(response, dict) and 'models' in response:
+                    models = response['models']
+                    if models:
+                        # Extract model names safely
+                        model_names = []
+                        for m in models:
+                            if isinstance(m, dict) and 'name' in m:
+                                model_names.append(m['name'])
+                            elif isinstance(m, str):
+                                model_names.append(m)
+                            else:
+                                logger.warning(f"Unexpected model format: {m}")
+                        
+                        logger.info(f"Successfully connected to Ollama. Available models: {model_names}")
+                        return True
+                    else:
+                        logger.warning("Connected to Ollama but no models found")
+                        return True
+                else:
+                    logger.info("Connected to Ollama (response format unclear)")
+                    return True
+            else:
+                logger.error("Connected to Ollama but received empty response")
+                return False
+        except Exception as e:
+            logger.error(f"Failed to connect to Ollama: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
+
+    def _normalize_model_name(self, model_name: str) -> str:
+        """Normalize model name to match Ollama's format"""
+        # If the model name includes a variant (like :1b), keep it
+        # Otherwise, append :latest
+        if ':' not in model_name:
+            model_name = f"{model_name}:latest"
+        return model_name
+
+    async def generate_response(self, prompt: str, model_type: str = 'general', 
+                              system_prompt: str = None, context: Dict = None,
+                              user_id: str = None) -> Dict:
+        """Generate response using specified Ollama model"""
+        # Check Ollama connection first
+        if not await self.check_ollama_connection():
+            return {
+                'success': False,
+                'error': "Unable to connect to Ollama server. Please make sure it's running.",
+                'model': model_type
+            }
+            
+        # If model_type is a full model name (e.g., llama3.2:1b), use it directly
+        # Otherwise, try to get it from our configured models
+        model = model_type if ':' in model_type else self.models.get(model_type, self.models['general'])
+        model = self._normalize_model_name(model)
+        
+        logger.info(f"Attempting to use model: {model}")
+        
+        # Try to get available models
+        available_models = await self.get_available_models()
+        available_model_names = [m.get('name', m) if isinstance(m, dict) else str(m) for m in available_models]
+        logger.info(f"Current available models: {available_model_names}")
+        
+        # For now, skip model availability check if we can't get the list properly
+        if available_model_names and model not in available_model_names:
+            # Try without the :latest suffix
+            model_base = model.split(':')[0]
+            if not any(model_base in m for m in available_model_names):
+                return {
+                    'success': False,
+                    'error': f"Model {model} is not available. Available models: {available_model_names}",
+                    'model': model
+                }
+        
+        # Build prompt with conversation history
+        full_prompt = self._build_prompt(prompt, system_prompt, context, user_id)
+        
+        for attempt in range(self.max_retries):
+            try:
+                response = await self.client.generate(
+                    model=model,
+                    prompt=full_prompt,
+                    options={
+                        'temperature': 0.7,
+                        'top_p': 0.9,
+                        'num_ctx': 4096
+                    }
+                )
+                
+                # Add to conversation history if successful
+                if user_id:
+                    self.add_to_history(user_id, "user", prompt)
+                    self.add_to_history(user_id, "assistant", response['response'])
+                
+                return {
+                    'success': True,
+                    'response': response['response'],
+                    'model': model,
+                    'tokens': response.get('eval_count', 0),
+                    'generation_time': response.get('eval_duration', 0) / 1e9
+                }
+            except Exception as e:
+                logger.error(f"Ollama generation attempt {attempt + 1} failed: {e}")
+                if attempt == self.max_retries - 1:
+                    return {
+                        'success': False,
+                        'error': str(e),
+                        'model': model
+                    }
+                await asyncio.sleep(2 ** attempt)
+
+    async def _ensure_model_available(self, model_name: str) -> bool:
+        """Ensure the requested model is available"""
+        try:
+            # List available models
+            response = await self.client.list()
+            logger.info(f"Raw Ollama response: {response}")
+            
+            if not response:
+                logger.error("Empty response from Ollama list command")
+                return True  # Assume it's available to avoid blocking
+                
+            # Handle different response formats
+            models = []
+            if isinstance(response, dict) and 'models' in response:
+                models = response.get('models', [])
+            elif isinstance(response, list):
+                models = response
+            else:
+                logger.warning(f"Unexpected response format: {type(response)}")
+                return True  # Assume it's available
+            
+            available_models = []
+            for m in models:
+                if isinstance(m, dict) and 'name' in m:
+                    available_models.append(m['name'])
+                elif isinstance(m, str):
+                    available_models.append(m)
+                else:
+                    logger.warning(f"Unexpected model format in list: {m}")
+            
+            logger.info(f"Available models: {available_models}")
+            
+            if model_name not in available_models:
+                logger.warning(f"Model {model_name} not found in available models: {available_models}")
+                # Check if base model exists (without :latest)
+                model_base = model_name.split(':')[0]
+                if any(model_base in m for m in available_models):
+                    return True
+                return False
+            
+            logger.info(f"Model {model_name} is available")
+            return True
+        except Exception as e:
+            logger.error(f"Error checking model availability: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return True  # Assume it's available on error to avoid blocking
+    
+    def _get_user_history(self, user_id: str) -> List[Dict]:
+        """Get conversation history for a user"""
+        return self.conversation_history.get(user_id, [])
+    
+    def add_to_history(self, user_id: str, role: str, content: str):
+        """Add a message to the user's conversation history"""
+        if user_id not in self.conversation_history:
+            self.conversation_history[user_id] = []
+            
+        history = self.conversation_history[user_id]
+        history.append({
+            'role': role,
+            'content': content,
+            'timestamp': asyncio.get_running_loop().time()
+        })
+        
+        # Keep only the last N messages
+        if len(history) > self.max_history_length:
+            history.pop(0)
+    
+    def _build_prompt(self, prompt: str, system_prompt: str = None, 
+                     context: Dict = None, user_id: str = None) -> str:
+        """Build comprehensive prompt with context and conversation history"""
+        parts = []
+        
+        if system_prompt:
+            parts.append(f"SYSTEM: {system_prompt}")
+        
+        if context:
+            parts.append(f"CONTEXT: {json.dumps(context, indent=2)}")
+        
+        # Add conversation history if available
+        if user_id:
+            history = self._get_user_history(user_id)
+            if history:
+                history_text = "\n\n".join([
+                    f"{msg['role'].upper()}: {msg['content']}"
+                    for msg in history[-5:]  # Include last 5 messages for context
+                ])
+                parts.append(f"PREVIOUS CONVERSATION:\n{history_text}")
+        
+        parts.append(f"USER: {prompt}")
+        
+        return "\n\n".join(parts)
+    
+    async def parse_research_query(self, query_text: str) -> Dict:
+        """Parse biomedical research query using Ollama"""
+        system_prompt = """
+        You are a biomedical research query parser. Extract structured information from user queries.
+        
+        Return a JSON object with these fields:
+        - research_topic: Main research area/disease
+        - genes_proteins: List of specific genes/proteins mentioned
+        - study_types: Types of studies needed (clinical_trial, review, case_study, etc.)
+        - organisms: Species/organisms of interest
+        - date_constraints: Any time limitations mentioned
+        - databases: Suggested NCBI databases to search
+        - search_strategy: Recommended search approach
+        """
+        
+        response = await self.generate_response(
+            prompt=f"Parse this biomedical query: '{query_text}'",
+            model_type='biomedical',
+            system_prompt=system_prompt
+        )
+        
+        if response['success']:
+            try:
+                return json.loads(response['response'])
+            except json.JSONDecodeError:
+                return self._fallback_query_parsing(query_text)
+        else:
+            return self._fallback_query_parsing(query_text)
+    
+    def _fallback_query_parsing(self, query_text: str) -> Dict:
+        """Simple fallback parsing when Ollama fails"""
+        return {
+            'research_topic': query_text[:100],
+            'genes_proteins': [],
+            'study_types': ['publication'],
+            'organisms': ['human'],
+            'date_constraints': None,
+            'databases': ['pubmed'],
+            'search_strategy': 'broad_search'
+        }
+    
+    async def analyze_literature_results(self, abstracts: List[Dict]) -> Dict:
+        """Analyze literature search results"""
+        system_prompt = """
+        You are a biomedical literature analyst. Analyze these research paper abstracts and provide:
+        
+        1. key_themes: Main research themes (max 5)
+        2. significant_findings: Important discoveries or conclusions
+        3. research_gaps: Identified gaps in current research
+        4. clinical_relevance: Clinical applications and implications
+        5. emerging_trends: New or growing research directions
+        6. methodology_summary: Common research approaches used
+        7. quality_assessment: Overall quality and reliability of studies
+        
+        Return structured JSON format.
+        """
+        
+        abstracts_text = "\n\n".join([
+            f"Paper {i+1}: {abstract.get('title', 'No title')}\n{abstract.get('abstract', 'No abstract')}"
+            for i, abstract in enumerate(abstracts[:10])
+        ])
+        
+        response = await self.generate_response(
+            prompt=f"Analyze these research abstracts:\n\n{abstracts_text}",
+            model_type='analysis',
+            system_prompt=system_prompt
+        )
+        
+        if response['success']:
+            try:
+                return json.loads(response['response'])
+            except json.JSONDecodeError:
+                return self._fallback_analysis()
+        else:
+            return self._fallback_analysis()
+    
+    def _fallback_analysis(self) -> Dict:
+        """Fallback analysis when Ollama fails"""
+        return {
+            'key_themes': ['Unable to analyze'],
+            'significant_findings': ['Analysis unavailable'],
+            'research_gaps': ['Unable to identify'],
+            'clinical_relevance': 'Analysis unavailable',
+            'emerging_trends': ['Unable to determine'],
+            'methodology_summary': 'Analysis unavailable',
+            'quality_assessment': 'Unable to assess'
+        }
+    
+    async def generate_search_strategy(self, parsed_query: Dict) -> Dict:
+        """Generate optimized NCBI search strategy"""
+        system_prompt = """
+        You are an NCBI search optimization expert. Based on the parsed query, generate:
+        
+        1. optimized_terms: Best search terms for NCBI
+        2. mesh_terms: Relevant MeSH headings
+        3. field_restrictions: Specific field searches [ti], [au], [dp], etc.
+        4. database_sequence: Optimal order of database searches
+        5. filters: Date, species, publication type filters
+        6. boolean_logic: Advanced boolean search strategy
+        
+        Return JSON format with practical NCBI E-utilities parameters.
+        """
+        
+        response = await self.generate_response(
+            prompt=f"Create NCBI search strategy for: {json.dumps(parsed_query)}",
+            model_type='biomedical',
+            system_prompt=system_prompt
+        )
+        
+        if response['success']:
+            try:
+                return json.loads(response['response'])
+            except json.JSONDecodeError:
+                return self._fallback_search_strategy(parsed_query)
+        else:
+            return self._fallback_search_strategy(parsed_query)
+    
+    def _fallback_search_strategy(self, parsed_query: Dict) -> Dict:
+        """Fallback search strategy"""
+        return {
+            'optimized_terms': [parsed_query.get('research_topic', '')],
+            'mesh_terms': [],
+            'field_restrictions': [],
+            'database_sequence': ['pubmed'],
+            'filters': {},
+            'boolean_logic': 'simple'
+        }
+    
+    async def get_available_models(self) -> List[Dict]:
+        """Get list of available Ollama models"""
+        try:
+            response = await self.client.list()
+            logger.info(f"Raw Ollama list response: {response}")
+            
+            if not response:
+                logger.error("Empty response from Ollama list command")
+                return []
+            
+            # Handle different response formats
+            models = []
+            if isinstance(response, dict) and 'models' in response:
+                raw_models = response.get('models', [])
+            elif isinstance(response, list):
+                raw_models = response
+            else:
+                logger.warning(f"Unexpected response format: {type(response)}")
+                return []
+            
+            # Process models into consistent format
+            for m in raw_models:
+                if isinstance(m, dict):
+                    # Standard format with all fields
+                    models.append(m)
+                elif isinstance(m, str):
+                    # Just a model name string
+                    models.append({'name': m})
+                else:
+                    logger.warning(f"Unexpected model format: {type(m)}")
+            
+            # Sort models by name for consistent display
+            models.sort(key=lambda x: x.get('name', ''))
+            return models
+        except Exception as e:
+            logger.error(f"Error fetching models: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return []
+
+# Singleton instance
+ollama_service = OllamaService()

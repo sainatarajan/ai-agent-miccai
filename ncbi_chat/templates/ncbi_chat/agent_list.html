@@ -1,0 +1,42 @@
+{% extends 'base.html' %}
+
+{% block content %}
+<div class="container">
+    <h2 class="mb-4">Active Agents</h2>
+    
+    <div class="row">
+        {% for agent in agents %}
+        <div class="col-md-4 mb-4">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0">{{ agent.name }}</h5>
+                    <span class="status-dot {{ agent.status }}"></span>
+                </div>
+                <div class="card-body">
+                    <p><strong>Type:</strong> {{ agent.agent_type }}</p>
+                    <p><strong>Status:</strong> {{ agent.status|title }}</p>
+                    <p><strong>Last Heartbeat:</strong> {{ agent.last_heartbeat|timesince }} ago</p>
+                    
+                    <h6 class="mt-3">Active Tools</h6>
+                    <ul class="list-unstyled">
+                        {% for tool in agent.get_active_tools %}
+                        <li>
+                            <span class="badge bg-primary">{{ tool.name }}</span>
+                        </li>
+                        {% empty %}
+                        <li>No active tools</li>
+                        {% endfor %}
+                    </ul>
+                    
+                    <a href="{% url 'ncbi_chat:agent_detail' agent.id %}" class="btn btn-outline-primary">View Details</a>
+                </div>
+            </div>
+        </div>
+        {% empty %}
+        <div class="col">
+            <div class="alert alert-info">No agents are currently registered.</div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,80 @@
+{% extends 'base.html' %}
+
+{% block content %}
+<div class="container">
+    <div class="row">
+        <div class="col-md-8 offset-md-2">
+            <div class="card">
+                <div class="card-header">
+                    <h3 class="mb-0">
+                        {{ agent.name }}
+                        <span class="status-dot {{ agent.status }} float-end mt-2"></span>
+                    </h3>
+                </div>
+                <div class="card-body">
+                    <div class="row mb-4">
+                        <div class="col-md-6">
+                            <h5>Agent Details</h5>
+                            <ul class="list-unstyled">
+                                <li><strong>Type:</strong> {{ agent.agent_type }}</li>
+                                <li><strong>Status:</strong> {{ agent.status|title }}</li>
+                                <li><strong>Last Heartbeat:</strong> {{ agent.last_heartbeat|timesince }} ago</li>
+                            </ul>
+                        </div>
+                        <div class="col-md-6">
+                            <h5>Performance Metrics</h5>
+                            <ul class="list-unstyled">
+                                {% for metric, value in agent.performance_metrics.items %}
+                                <li><strong>{{ metric|title }}:</strong> {{ value }}</li>
+                                {% empty %}
+                                <li>No metrics available</li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                    </div>
+
+                    <h5>Available Tools</h5>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Tool Name</th>
+                                    <th>Status</th>
+                                    <th>Last Execution</th>
+                                    <th>Execution Count</th>
+                                    <th>Avg. Execution Time</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for tool in tools %}
+                                <tr>
+                                    <td>{{ tool.name }}</td>
+                                    <td>
+                                        <span class="badge bg-{{ tool.status }}">
+                                            {{ tool.status|title }}
+                                        </span>
+                                    </td>
+                                    <td>{{ tool.last_execution|default_if_none:"Never" }}</td>
+                                    <td>{{ tool.execution_count }}</td>
+                                    <td>{{ tool.average_execution_time|floatformat:2 }}s</td>
+                                </tr>
+                                {% empty %}
+                                <tr>
+                                    <td colspan="5" class="text-center">No tools available</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="mt-4">
+                        <a href="{% url 'ncbi_chat:agent_list' %}" class="btn btn-outline-primary">
+                            Back to Agent List
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
